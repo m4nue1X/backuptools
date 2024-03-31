@@ -1,0 +1,156 @@
+#!/usr/bin/python3
+
+# dependencies: python3, python3-dateutil
+
+import argparse
+import subprocess
+import os
+import re
+import datetime
+import sys
+import locale
+import calendar
+
+class Logger:
+    def __init__(self, verbose, quiet):
+        self.level = 1
+        if quiet:
+            self.level = 0
+        elif verbose:
+            self.level = 2
+
+    def error(self, msg):
+        print(msg, file=sys.stderr)
+
+    def info(self, msg):
+        if self.level >= 1:
+            print(msg)
+
+    def debug(self, msg):
+        if self.level >= 2:
+            print(msg)
+
+class BtrfsSnapshotter:
+    btrfs_cmd = ["btrfs"]
+
+    def __init__(self, mountpoint, live_snapshot, snapshot_prefix, writable, sudo, dry_run, logger):
+        self.mountpoint = os.path.abspath(mountpoint)
+        self.live_snapshot = live_snapshot
+        self.snapshot_prefix = snapshot_prefix
+        self.writable = writable
+        self.dry_run = dry_run
+        self.logger = logger
+        if sudo:
+            self.btrfs_cmd = ["sudo"] + self.btrfs_cmd
+        self.run_btrfs(["filesystem", "df", self.mountpoint], override_dry_run=True, error=ValueError(f'"{self.mountpoint}" doesn\'t seem to be a btrfs or btrfs is not installed'))
+        self.live_snapshot_path = os.path.join(self.mountpoint, self.live_snapshot)
+        self.run_btrfs(["subvolume", "show", self.live_snapshot_path], override_dry_run=True, error=ValueError(f'{self.live_snapshot} doesn\'t seem to be a subvolume of {self.mountpoint}'))
+
+    def run_btrfs(self, sub_command, capture_output=False, override_dry_run=False, error=None):
+        self.logger.debug(" ".join(self.btrfs_cmd + sub_command))
+        if not self.dry_run or override_dry_run:
+            if capture_output:
+                result = subprocess.run(self.btrfs_cmd + sub_command, stdout=subprocess.PIPE)
+            else:
+                result = subprocess.run(self.btrfs_cmd + sub_command, stdout=subprocess.DEVNULL)
+            if error and result.returncode != 0:
+                raise error
+            return result
+
+    def get_snapshot_name(self, date):
+        date_str = date.strftime("%Y-%m-%d")
+        return f"{self.snapshot_prefix}-{date_str}"
+
+    def create_snapshot(self, date):
+        snapshot_path = os.path.join(self.mountpoint, self.get_snapshot_name(date))
+        if self.writable:
+            self.run_btrfs(["subvolume", "snapshot", self.live_snapshot_path, snapshot_path], error=RuntimeError(f'Unable to create snapshot {snapshot_path}'))
+        else:
+            self.run_btrfs(["subvolume", "snapshot", "-r", self.live_snapshot_path, snapshot_path], error=RuntimeError(f'Unable to create snapshot {snapshot_path}'))
+
+    def delete_snapshot(self, date):
+        snapshot_path = os.path.join(self.mountpoint, self.get_snapshot_name(date))
+        self.run_btrfs(["subvolume", "delete", "", snapshot_path], error=RuntimeError(f'Unable to delete snapshot {snapshot_path}'))
+
+    def get_existing_snapshots(self):
+        snapshot_name_regex = re.compile(f'.*path\s+{self.snapshot_prefix}-([0-9]{{4}})-([0-9]{{2}})-([0-9]{{2}})$')
+        output = self.run_btrfs(["subvolume", "list", "-os", self.mountpoint], capture_output=True, override_dry_run=True).stdout.decode("utf-8")
+        existing_snapshots = set()
+        for line in output.splitlines():
+            match = re.match(snapshot_name_regex, line)
+            if match:
+                existing_snapshots.add(datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3))))
+        return existing_snapshots
+
+def check_within_range(value, message, min=None, max=None):
+    if (min != None and value < min) or (max != None and value > max):
+        print("here")
+        raise ValueError(message)
+
+def main():
+    # set locale to english so we'll be able to process the english name of the day
+    locale.setlocale(locale.LC_ALL, locale.normalize('C'))
+    arg_parser = argparse.ArgumentParser(prog="snapshotmgr", description="Automatically creates and manages btrfs snapshots")
+    arg_parser.add_argument("--dailys", action="store", type=int, default="7")
+    arg_parser.add_argument("--weeklys", action="store", type=int, default="4")
+    arg_parser.add_argument("--monthlys", action="store", type=int, default="12")
+    arg_parser.add_argument("--weekly_day", action="store", choices=list(calendar.day_name), default=calendar.day_name[0])
+    arg_parser.add_argument("--mountpoint", required=True, action="store")
+    arg_parser.add_argument("--live_snapshot", action="store", default="live")
+    arg_parser.add_argument("--snapshot_prefix", action="store", default="snapshot")
+    arg_parser.add_argument("--writable", required=False, action="store_true")
+    arg_parser.add_argument("--sudo", required=False, action="store_true")
+    arg_parser.add_argument("--dry-run", required=False, action="store_true")
+    arg_parser.add_argument("--verbose", required=False, action="store_true")
+    arg_parser.add_argument("--quiet", required=False, action="store_true")
+    args = arg_parser.parse_args()
+    logger = Logger(args.verbose or args.dry_run, args.quiet)
+    # check arguments
+    check_within_range(args.dailys, "Number of dailys must be >= 0", min=0)
+    check_within_range(args.weeklys, "Number of weeklys must be >= 0", min=0)
+    check_within_range(args.monthlys, "Number of monlys must be >= 0", min=0)
+    weekly_weekday = datetime.datetime.strptime(args.weekly_day, "%A").weekday()
+    today = datetime.date.today()
+    logger.info(f"Running snapshotmgr on {today.strftime('%Y-%m-%d')}")
+    logger.info(f"        mountpoint: {args.mountpoint}")
+    logger.info(f"    live subvolume: {args.live_snapshot}")
+    logger.info(f"  snapshot pfrefix: {args.snapshot_prefix}")
+    logger.info(f"       daily count: {args.dailys}")
+    logger.info(f"      weekly count: {args.weeklys}")
+    logger.info(f"     monthly count: {args.monthlys}")
+    logger.info(f"          writable: {args.writable}")
+    logger.info(f"              sudo: {args.sudo}")
+    logger.info(f"           dry-run: {args.dry_run}")
+    # create snapshotter
+    snapshotter = BtrfsSnapshotter(args.mountpoint, args.live_snapshot, args.snapshot_prefix, args.writable, args.sudo, args.dry_run, logger)
+    # create list of existing sanpshots
+    existing_snapshots = snapshotter.get_existing_snapshots()
+    logger.info(f"Found {len(existing_snapshots)} snapshots")
+    # create snapshof for today if it doesn't exist yet
+    if not today in existing_snapshots:
+        logger.info(f"Creating today's snapshot")
+        snapshotter.create_snapshot(today)
+        existing_snapshots.add(today)
+    # determine which snapshots can be deleted
+    dailys = [ today + datetime.timedelta(days=-day) for day in range(0, args.dailys) ]
+    last_weekly = today + datetime.timedelta(days=weekly_weekday-today.weekday() - (0 if today.weekday() > weekly_weekday else 7))
+    weeklys = [ last_weekly + datetime.timedelta(weeks=-week) for week in range(0, args.weeklys) ]
+    last_monthly = last_weekly - datetime.timedelta(weeks=int(last_weekly.day / 7))
+    monthlys = { last_monthly }
+    for month in range(0, args.monthlys-1):
+        last_monthly = last_monthly + datetime.timedelta(weeks=-4)
+        if last_monthly.day > 7:
+            last_monthly = last_monthly + datetime.timedelta(days=-7)
+        monthlys.add(last_monthly)
+    logger.debug(f'Wanted daily snapshots: {dailys}')
+    logger.debug(f'Wanted weeky snapshots: {weeklys}')
+    logger.debug(f'Wanted monthly snapshots: {monthlys}')
+    # delete obsolte snapshots
+    for entry in existing_snapshots:
+        if not entry in dailys and not entry in weeklys and not entry in monthlys:
+            logger.info(f"Deleting obsolete snapshot {entry.strftime('%Y-%m-%d')}")
+            snapshotter.delete_snapshot(entry)
+    logger.info(f"Snapshots are up to date.")
+
+if __name__ == "__main__":
+    main()
