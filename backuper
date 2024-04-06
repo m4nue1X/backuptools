@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+
+import argparse
+import glob
+import os.path
+import os
+import tempfile
+import subprocess
+from datetime import datetime
+from datetime import timedelta
+import psutil
+import shutil
+import time
+import sys
+
+class EncFSManager:
+    def __init__(self, dir, key_file, create):
+        if not create and not os.path.isdir(dir):
+            raise ValueError(f"\"{dir}\" is not a directory")
+        if not key_file:
+            raise ValueError("Key file must be specified when using EncFS")
+        with open(key_file) as file:
+            self.key = file.readline().strip()
+        if len(self.key) <= 0:
+            raise ValueError("The key can't be empty. Please provide a key file containing jsut the key in the very first line.")
+        if not create:
+            encfs_config = os.path.join(dir, ".encfs*,xml")
+            if len(glob.glob(os.path.join(dir, ".encfs*.xml"))) < 1:
+                raise ValueError(f"\"{dir}\" does not seem to contain an EncFS.")
+        else:
+            if len(glob.glob(os.path.join(dir, ".encfs*.xml"))) > 0:
+                raise ValueError(f"Requested to create an EncFS in \"{dir}\", but directory seems to contain an EncFS already")
+            elif len(glob.glob(os.path.join(dir, "*"))) > 0:
+                raise ValueError(f"Requested to create an EncFS in \"{dir}\", but directory is not empty")
+        self.dir = dir
+        self.create = create
+    
+    def mount(self):
+        # create encfs directory if necessary
+        if self.create and not os.path.isdir(dir):
+            os.mkdir(self.dir)
+        # create temporary mount point for EncFS
+        self.temp_dir = tempfile.mkdtemp()
+        # mount (and optionally create the EncFS
+        if self.create:
+            encfs_command = ["encfs", "-f", "--paranoia", "--stdinpass", os.path.abspath(self.dir), self.temp_dir]
+        else:
+            encfs_command = ["encfs", "-f", "--stdinpass", os.path.abspath(self.dir), self.temp_dir]
+        self.encfs_process = subprocess.Popen(encfs_command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # send the password
+        self.encfs_process.stdin.write(self.key.encode("utf-8") + b"\n")
+        self.encfs_process.stdin.flush()
+        # wait for EncFS to become available
+        timeout = datetime.now() + timedelta(seconds=30)
+        mounted = False
+        while datetime.now() < timeout and not mounted and not self.encfs_process.poll():
+            time.sleep(.1)
+            for partition in psutil.disk_partitions(all=True):
+                if partition.fstype == "fuse.encfs" and partition.mountpoint == self.temp_dir:
+                    mounted = True
+                    break
+        if self.encfs_process.poll():
+            raise RuntimeError(f"Failed to mount EncFS. Is the password wrong? {len(self.key)}")
+        if not mounted:
+            self.encfs_process.terminate()
+            raise RuntimeError("Timeout occured while trying to mount EncFS")
+        self.create = False
+        return self.temp_dir
+
+    def unmount(self):
+        # check if the encfs process is still running
+        if self.encfs_process and self.encfs_process.poll() is None:
+            # if it is running, send SIGTERM and wait up to 30 seconds for the process to finsh
+            self.encfs_process.terminate()
+            self.encfs_process.wait(30)
+            if self.encfs_process.poll() is None or self.encfs_process.returncode != 0:
+                raise RuntimeError(f"Failed to unmount EncFS under {self.temp_dir}.")
+            self.encfs_process = None
+        # remove the EncFS mountpoint
+        if self.temp_dir:
+            if len(glob.glob(os.path.join(self.temp_dir, "*"))) > 0:
+                raise RuntimeError(f"Temporary directory {self.temp_dir} is not empty.")
+            os.rmdir(self.temp_dir)
+            self.temp_dir = None
+
+class Backuper:
+    def __init__(self, src_dir, dest_dir, exclude_patterns=None, exclude_from_files=None, checksum=False, no_delete=False, bandwidth_limit=None, logfile=None, quiet=False):
+        if not os.path.isdir(src_dir):
+            raise ValueError(f"{src_dir} is not a directory.")
+        if not os.path.isdir(dest_dir):
+            raise ValueError(f"{dest_dir} is not a directory.")
+        if exclude_from_files:
+            for exclude_from_file in exclude_from_files:
+                if not os.path.isfile(exclude_from_file):
+                    raise ValueError(f"{exclude_from_file} cout not be found.")
+        self.src_dir = src_dir
+        self.dest_dir = dest_dir
+        self.exclude_patterns = exclude_patterns
+        self.exclude_from_files = exclude_from_files
+        self.checksum = checksum
+        self.no_delete = no_delete
+        self.bandwidth_limit = bandwidth_limit
+        self.quiet = quiet
+        self.logfile = logfile
+
+    def backup(self, dry_run=False):
+        # run rsync
+        rsync_command = [ "rsync", "-a", "--progress" ]
+        if dry_run:
+            rsync_command.append("--dry-run")
+        if self.bandwidth_limit:
+            rsync_command.append(f"--bwlimit={bandwidth_limit}")
+        if self.checksum:
+            rsync_command.append("--checksum")
+        if not self.no_delete:
+            rsync_command.append("--delete")
+        if self.exclude_patterns:
+            for exclude_pattern in self.exclude_patterns:
+                rsync_command.append(f"--exclude={exclude_pattern}")
+        if self.exclude_from_files:
+            for exclude_from_file in self.exclude_from_files:
+                rsync_command.append(f"--exclude-from={exclude_from_file}")
+        # add the source and destination path (with a trailing /)
+        rsync_command.append(os.path.join(os.path.abspath(self.src_dir), ""))
+        rsync_command.append(os.path.join(os.path.abspath(self.dest_dir), ""))
+        if self.logfile:
+            returncode = subprocess.run(rsync_command, stdout=open(self.logfile, "w")).returncode
+        elif self.quiet:
+            returncode = subprocess.run(rsync_command, stdout=subprocess.DEVNULL).returncode
+        else:
+            returncode = subprocess.run(rsync_command).returncode
+
+        if returncode != 0:
+            raise RuntimeError(f"rsync failed: {returncode}")
+    
+
+def main():
+    arg_parser = argparse.ArgumentParser(prog="snapshotmgr", description="Automatically creates and manages btrfs snapshots")
+    arg_parser.add_argument("--dir", action="store", required=True)
+    arg_parser.add_argument("--backup-dir", action="store", required=True)    
+    arg_parser.add_argument("--encfs-key-file", action="store")
+    arg_parser.add_argument("--encfs-create", action="store_true")
+    arg_parser.add_argument("--exclude", action="append")
+    arg_parser.add_argument("--exclude-from", action="append")
+    arg_parser.add_argument("--dry-run", action="store_true")
+    arg_parser.add_argument("--bandwidth-limit", action="store")
+    arg_parser.add_argument("--checksum", action="store_true")
+    arg_parser.add_argument("--no-delete", action="store_true")
+    arg_parser.add_argument("--quiet", action="store_true")
+    arg_parser.add_argument("--logfile", action="store")
+    args = arg_parser.parse_args()
+    backup_dir = args.backup_dir
+    use_encfs = (args.encfs_key_file or args.encfs_create)
+    if use_encfs:
+        encfs = EncFSManager(args.backup_dir, args.encfs_key_file, args.encfs_create)
+        backup_dir = encfs.mount()
+    backuper = Backuper(args.dir, backup_dir, args.exclude, args.exclude_from, args.checksum, args.no_delete, args.bandwidth_limit, args.logfile, args.quiet)
+    backuper.backup(args.dry_run)
+    if use_encfs:
+        encfs.unmount()
+    return os.EX_OK
+    
+
+if __name__ == "__main__":
+    sys.exit(main())
