@@ -12,6 +12,8 @@ import psutil
 import shutil
 import time
 import sys
+import yaml
+from pathlib import Path
 
 class EncFSManager:
     def __init__(self, dir, key_file, create):
@@ -132,34 +134,102 @@ class Backuper:
 
         if returncode != 0:
             raise RuntimeError(f"rsync failed: {returncode}")
+
+class BackupConfig:
+    def __init__(self):
+        self.backupconfig_yaml = os.path.join(Path.home(), ".config", "backupconfig.yaml")
+
+    def load_config(self, dir, backup_dir):
+        if os.path.isfile(self.backupconfig_yaml):
+            with open(self.backupconfig_yaml, "r") as yaml_file:
+                config_data = yaml.safe_load(yaml_file)
+                for backup in config_data:
+                    if backup["dir"] == os.path.normpath(dir) and backup["backup_dir"] == os.path.normpath(backup_dir):
+                        return backup["config"]
+        return {}
+
+    def store_config(self, dir, backup_dir, config):
+        updated = False
+        config_data = []
+        if os.path.isfile(self.backupconfig_yaml):
+            with open(self.backupconfig_yaml, "r") as yaml_file:
+                config_data = yaml.safe_load(yaml_file)
+                for backup in config_data:
+                    if backup["dir"] == os.path.normpath(dir) and backup["backup_dir"] == os.path.normpath(backup_dir):
+                        backup["config"] = config
+                        updated = True
+                        break
+        if not updated:
+            config_data.append({ "dir": os.path.normpath(dir), "backup_dir": os.path.normpath(backup_dir), "config": config })
+        with open(self.backupconfig_yaml, "w") as yaml_file:
+            yaml.dump(config_data, yaml_file)
     
+    def get_last_backup(self, dir, backup_dir):
+        config = self.load_config(dir, backup_dir)
+        if "timestamp" in config:
+            return datetime.fromisoformat(config["timestamp"])
+        return None
+
+    def store_last_backup(self, dir, backup_dir, timestamp):
+        self.store_config(dir, backup_dir, { "timestamp": timestamp.isoformat() })
 
 def main():
-    arg_parser = argparse.ArgumentParser(prog="snapshotmgr", description="Automatically creates and manages btrfs snapshots")
-    arg_parser.add_argument("--dir", action="store", required=True)
-    arg_parser.add_argument("--backup-dir", action="store", required=True)    
-    arg_parser.add_argument("--encfs-key-file", action="store")
-    arg_parser.add_argument("--encfs-create", action="store_true")
-    arg_parser.add_argument("--exclude", action="append")
-    arg_parser.add_argument("--exclude-from", action="append")
-    arg_parser.add_argument("--dry-run", action="store_true")
-    arg_parser.add_argument("--bandwidth-limit", action="store")
-    arg_parser.add_argument("--checksum", action="store_true")
-    arg_parser.add_argument("--no-delete", action="store_true")
-    arg_parser.add_argument("--quiet", action="store_true")
-    arg_parser.add_argument("--logfile", action="store")
+    arg_parser = argparse.ArgumentParser(prog="backuper", description="Creates (optionally encrypted) backups.")
+    arg_parser.add_argument("--dir", action="store", required=True, help="Directory to backup.")
+    arg_parser.add_argument("--backup-dir", action="store", required=True, help="Directory to backup to.")
+    arg_parser.add_argument("--encfs-key-file", action="store", help="Use EncFS, read key from file.")
+    arg_parser.add_argument("--encfs-create", action="store_true", help="Create the EncFS if it doesn't exist.")
+    arg_parser.add_argument("--exclude", action="append", help="rsync exclude patterns (can be specified multiple times).")
+    arg_parser.add_argument("--exclude-from", action="append", help="rsync exclude-from file (can be specified multiple times).")
+    arg_parser.add_argument("--dry-run", action="store_true", help="Perform an rsync dry-run.")
+    arg_parser.add_argument("--bandwidth-limit", action="store", help="rsync badnwidth limit.")
+    arg_parser.add_argument("--checksum", action="store_true", help="Use checksums rather than metadata to check if a file has changed.")
+    arg_parser.add_argument("--no-delete", action="store_true", help="Don't delete files from backup which no longer exist in the original.")
+    arg_parser.add_argument("--quiet", action="store_true", help="Don't print anything, except there is a non-quiet failure.")
+    arg_parser.add_argument("--logfile", action="store", help="Store rsync output in file, rather than printing it.")
+    arg_parser.add_argument("--interval", action="store", choices=[ "hourly", "daily", "weekly", "monthly" ], help="Interval indicating how frequently actually performing a backup.")
+    arg_parser.add_argument("--fail-quiet-duration", action="store", type=int, help="Duration in hours how long backup failures are ignored.")
+    arg_parser.add_argument("--fail-quiet", action="store_true", help="Ignore all backup filaures.")
     args = arg_parser.parse_args()
-    backup_dir = args.backup_dir
-    use_encfs = (args.encfs_key_file or args.encfs_create)
-    if use_encfs:
-        encfs = EncFSManager(args.backup_dir, args.encfs_key_file, args.encfs_create)
-        backup_dir = encfs.mount()
-    backuper = Backuper(args.dir, backup_dir, args.exclude, args.exclude_from, args.checksum, args.no_delete, args.bandwidth_limit, args.logfile, args.quiet)
-    backuper.backup(args.dry_run)
-    if use_encfs:
-        encfs.unmount()
-    return os.EX_OK
-    
+    # determine date of last backup
+    config = BackupConfig()
+    last_backup = config.get_last_backup(args.dir, args.backup_dir)
+    if not args.quiet:
+        if last_backup:
+            print(f"Last backup: {last_backup.isoformat()}")
+        else:
+            print(f"Last backup: never")
+    now = datetime.now()
+    # if an interval was specified, check if the last backup was within that inerval
+    if args.interval and last_backup:
+        if args.interval == "hourly" and now.date() == last_backup.date() and now.hour == last_backup.hour:
+            return os.EX_OK
+        if args.interval == "daily" and now.date() == last_backup.date():
+            return os.EX_OK
+        if args.interval == "weekly" and now.year == last_backup.year and now.isocalendar().week == last_backup.isocalendar().week:
+            return os.EX_OK
+        if args.interval == "monthly" and now.year == last_backup.year and now.year == last_backup.year:
+            return os.EX_OK
+    # alright, lets get the backup started
+    try:
+        backup_dir = args.backup_dir
+        use_encfs = (args.encfs_key_file or args.encfs_create)
+        if use_encfs:
+            encfs = EncFSManager(args.backup_dir, args.encfs_key_file, args.encfs_create)
+            backup_dir = encfs.mount()
+        backuper = Backuper(args.dir, backup_dir, args.exclude, args.exclude_from, args.checksum, args.no_delete, args.bandwidth_limit, args.logfile, args.quiet)
+        backuper.backup(args.dry_run)
+        if use_encfs:
+            encfs.unmount()
+        if not args.dry_run:
+            config.store_last_backup(args.dir, args.backup_dir, datetime.now())
+        return os.EX_OK
+    except Exception as e:
+        if args.fail_quiet:
+            return os.EX_OK
+        if args.fail_quiet_duration and last_backup and (last_backup + timedelta(hours=args.fail_quiet_duration) > now):
+            return os.EX_OK
+        raise e
 
 if __name__ == "__main__":
     sys.exit(main())
