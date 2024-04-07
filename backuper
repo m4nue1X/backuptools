@@ -36,6 +36,12 @@ class EncFSManager:
                 raise ValueError(f"Requested to create an EncFS in \"{dir}\", but directory is not empty")
         self.dir = dir
         self.create = create
+
+    def __del__(self):
+        try:
+            self.unmount()
+        except:
+            pass
     
     def mount(self):
         # create encfs directory if necessary
@@ -211,9 +217,9 @@ def main():
         if args.interval == "monthly" and now.year == last_backup.year and now.year == last_backup.year:
             return os.EX_OK
     # alright, lets get the backup started
+    use_encfs = (args.encfs_key_file or args.encfs_create)
     try:
         backup_dir = args.backup_dir
-        use_encfs = (args.encfs_key_file or args.encfs_create)
         if use_encfs:
             encfs = EncFSManager(args.backup_dir, args.encfs_key_file, args.encfs_create)
             backup_dir = encfs.mount()
